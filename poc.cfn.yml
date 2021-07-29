@@ -1,0 +1,223 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: CloudFront Public/Private POC
+
+Parameters:
+
+  EnvName:
+    Type: String
+    Description: The environment name
+    Default: dev
+
+  CloudFrontPriceClass:
+    Description: Global locations CloudFront will serve content from
+    Type: String
+    Default: PriceClass_All
+    AllowedValues:
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+    ConstraintDescription: Specify PriceClass_100, PriceClass_200 or PriceClass_All
+
+  DefaultTtl:
+    Type: Number
+    Description: The default TTL in seconds for cached objects
+    MinValue: 30
+    MaxValue: 31536000 # One year
+    Default: 86400
+
+Resources:
+
+  OriginBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub static-origin-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  CloudFrontPublicOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub ${AWS::StackName}-public
+
+  CloudFrontPrivateOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub ${AWS::StackName}-private
+
+  OriginBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OriginBucket
+      PolicyDocument:
+        Statement:
+          - Sid: cloudfront-public-access
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub arn:aws:s3:::${OriginBucket}/*
+            Principal:
+              AWS: !Sub "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontPublicOriginAccessIdentity}"
+            Condition:
+              StringEquals:
+                s3:ExistingObjectTag/access: public
+          - Sid: cloudfront-private-access
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub arn:aws:s3:::${OriginBucket}/*
+            Principal:
+              AWS: !Sub "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontPrivateOriginAccessIdentity}"
+            Condition:
+              StringEquals:
+                s3:ExistingObjectTag/access: private
+          - Sid: enforce-ssl
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${OriginBucket}
+              - !Sub arn:aws:s3:::${OriginBucket}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  CloudFrontPublicDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub ${AWS::StackName}-public
+        PriceClass: !Ref CloudFrontPriceClass
+        Enabled: true
+        IPV6Enabled: true
+        HttpVersion: http2
+        DefaultCacheBehavior:
+          Compress: true
+          DefaultTTL: !Ref DefaultTtl
+          MinTTL: 3600
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          TargetOriginId: s3-origin-bucket
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - DomainName: !GetAtt OriginBucket.DomainName
+            Id: s3-origin-bucket
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${CloudFrontPublicOriginAccessIdentity}
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  CloudFrontPrivateDistributionPublicKey:
+    Type: AWS::CloudFront::PublicKey
+    Properties:
+      PublicKeyConfig:
+        Name: !Sub CloudFrontPrivateDistributionPublicKey-${EnvName}
+        CallerReference: !Sub CloudFrontPrivateDistributionPublicKey-${EnvName}
+        EncodedKey: |
+          -----BEGIN PUBLIC KEY-----
+          MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAy98jdCdEgIdBcH54z3jv
+          jsUJmVv4T6dTla0hzPb9tIPoEse8DFKb/gAkFksIBHOWgkJT/whqtTyXg7RkKJKA
+          BIMfrGQM74Gntd1HtqNE6MixCcCiv6ShMoLRRnUO936+qpC/jDVe2yAMd9TWV5G5
+          rkEW2DfQeSD8IHl1BaIFZUpRjBKczslJIzWXkEVmLaN2qAU7p8LXtNqX1zYVTlbP
+          1gOqoln0oJKOrWQLuH+Jv2+oiua9nXSG6TuhjSpsB1hi3PPPTVojpsHlZQ3ZNGqo
+          B7EUtPbRNh/Zv6zNdIvGEN7066zMhQC/PR8UfGx2EGH5+5f8NRI9afEBT/fbUbuA
+          fwIDAQAB
+          -----END PUBLIC KEY-----
+
+  CloudFrontPrivateDistributionPublicKeyGroup:
+    Type: AWS::CloudFront::KeyGroup
+    Properties:
+      KeyGroupConfig:
+        Name: !Sub ${AWS::StackName}-private
+        Items:
+          - !Ref CloudFrontPrivateDistributionPublicKey
+
+  CloudFrontPrivateDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub ${AWS::StackName}-private
+        PriceClass: !Ref CloudFrontPriceClass
+        Enabled: true
+        IPV6Enabled: true
+        HttpVersion: http2
+        DefaultCacheBehavior:
+          Compress: false
+          TrustedKeyGroups:
+            - !Ref CloudFrontPrivateDistributionPublicKeyGroup
+          DefaultTTL: !Ref DefaultTtl
+          MinTTL: 3600
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          TargetOriginId: s3-origin-bucket
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - DomainName: !GetAtt OriginBucket.DomainName
+            Id: s3-origin-bucket
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${CloudFrontPrivateOriginAccessIdentity}
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+
+Outputs:
+
+
+  CloudFrontPublicDistributionId:
+    Value: !Ref CloudFrontPublicDistribution
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudFrontPublicDistributionId
+
+  CloudFrontPublicDistributionDomainName:
+    Value: !GetAtt CloudFrontPublicDistribution.DomainName
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudFrontPublicDistributionDomainName
+
+  CloudFrontPrivateDistributionId:
+    Value: !Ref CloudFrontPrivateDistribution
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudFrontPrivateDistributionId
+
+  CloudFrontPrivateDistributionDomainName:
+    Value: !GetAtt CloudFrontPrivateDistribution.DomainName
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudFrontPrivateDistributionDomainName
+
+  CloudFrontPrivateDistributionPublicKeyId:
+    Value: !Ref CloudFrontPrivateDistributionPublicKey
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudFrontPrivateDistributionPublicKeyId
+
+
